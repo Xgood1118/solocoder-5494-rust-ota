@@ -2,11 +2,17 @@ use axum::{
     extract::{Path, State},
     Json,
 };
+use serde::Deserialize;
 use std::sync::Arc;
 
 use crate::AppState;
 use crate::error::AppResult;
-use crate::models::{Device, CreateDeviceRequest, UpdateDeviceRequest};
+use crate::models::{Device, CreateDeviceRequest, UpdateDeviceRequest, AuditLog};
+
+#[derive(Deserialize)]
+pub struct DeviceStatusTransitionRequest {
+    pub status: String,
+}
 
 pub async fn register_device(
     State(state): State<Arc<AppState>>,
@@ -34,6 +40,39 @@ pub async fn update_device(
     Json(req): Json<UpdateDeviceRequest>,
 ) -> AppResult<Json<Device>> {
     let device = Device::update(&state.pool, &device_id, &req).await?;
+    Ok(Json(device))
+}
+
+pub async fn transition_device_status(
+    State(state): State<Arc<AppState>>,
+    Path(device_id): Path<String>,
+    Json(req): Json<DeviceStatusTransitionRequest>,
+) -> AppResult<Json<Device>> {
+    let old_status = Device::transition_status(
+        &state.pool,
+        &device_id,
+        &req.status,
+        "api",
+    )
+    .await?;
+
+    AuditLog::create(
+        &state.pool,
+        "device_status_transition",
+        "api",
+        "device",
+        Some(&device_id),
+        Some(&old_status),
+        Some(&req.status),
+        None,
+        None,
+    )
+    .await?;
+
+    let device = Device::find_by_device_id(&state.pool, &device_id)
+        .await?
+        .ok_or_else(|| crate::error::AppError::NotFound(format!("Device {} not found", device_id)))?;
+
     Ok(Json(device))
 }
 

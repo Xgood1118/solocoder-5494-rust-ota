@@ -1,4 +1,5 @@
 mod config;
+mod crypto;
 mod db;
 mod error;
 mod models;
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 
 use config::Config;
+use crypto::CryptoService;
 use models::AppMetrics;
 use services::{FirmwareService, HmacService, GrayEngine, FailureMonitor};
 
@@ -22,6 +24,7 @@ pub struct AppState {
     pub firmware_service: FirmwareService,
     pub hmac_service: HmacService,
     pub gray_engine: GrayEngine,
+    pub crypto_service: CryptoService,
 }
 
 #[tokio::main]
@@ -61,6 +64,8 @@ async fn main() -> anyhow::Result<()> {
 
     let gray_engine = GrayEngine::new(pool.clone(), metrics.clone());
 
+    let crypto_service = CryptoService::new(&config.encryption_key);
+
     let (shutdown_flag, monitor_handle) = FailureMonitor::start_monitor_loop(
         pool.clone(),
         metrics.clone(),
@@ -73,12 +78,14 @@ async fn main() -> anyhow::Result<()> {
         firmware_service,
         hmac_service,
         gray_engine,
+        crypto_service,
     });
 
     let app = Router::new()
         .route("/api/v1/devices", post(routes::device::register_device))
         .route("/api/v1/devices/{device_id}", get(routes::device::get_device))
         .route("/api/v1/devices/{device_id}", put(routes::device::update_device))
+        .route("/api/v1/devices/{device_id}/status", post(routes::device::transition_device_status))
         .route("/api/v1/devices/{device_id}/heartbeat", post(routes::device::heartbeat))
         .route("/api/v1/firmware", post(routes::firmware::upload_firmware))
         .route("/api/v1/firmware", get(routes::firmware::list_firmware))

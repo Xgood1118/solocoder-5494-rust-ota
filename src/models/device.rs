@@ -2,7 +2,19 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
+
+fn is_valid_device_state_transition(from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+    match from {
+        "active" => matches!(to, "deactivated" | "retired"),
+        "deactivated" => matches!(to, "active" | "retired"),
+        "retired" => false,
+        _ => false,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Device {
@@ -14,6 +26,7 @@ pub struct Device {
     pub battery_level: Option<i64>,
     pub wifi_ssid: Option<String>,
     pub wifi_signal: Option<i64>,
+    pub status: String,
     pub last_heartbeat_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -39,7 +52,7 @@ impl Device {
     pub async fn find_by_device_id(pool: &SqlitePool, device_id: &str) -> AppResult<Option<Self>> {
         let device = sqlx::query_as::<_, Device>(
             r#"SELECT id, device_id, device_type, firmware_version, hardware_version,
-                      battery_level, wifi_ssid, wifi_signal, last_heartbeat_at,
+                      battery_level, wifi_ssid, wifi_signal, status, last_heartbeat_at,
                       created_at, updated_at
                FROM devices WHERE device_id = ?"#
         )
@@ -55,8 +68,8 @@ impl Device {
 
         sqlx::query(
             r#"INSERT INTO devices (device_id, device_type, firmware_version, hardware_version,
-                                    created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)"#
+                                    status, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'active', ?, ?)"#
         )
         .bind(&req.device_id)
         .bind(&req.device_type)
@@ -134,9 +147,10 @@ impl Device {
     pub async fn list_by_type(pool: &SqlitePool, device_type: &str, limit: i64, offset: i64) -> AppResult<Vec<Self>> {
         let devices = sqlx::query_as::<_, Device>(
             r#"SELECT id, device_id, device_type, firmware_version, hardware_version,
-                      battery_level, wifi_ssid, wifi_signal, last_heartbeat_at,
+                      battery_level, wifi_ssid, wifi_signal, status, last_heartbeat_at,
                       created_at, updated_at
-               FROM devices WHERE device_type = ? ORDER BY id LIMIT ? OFFSET ?"#
+               FROM devices WHERE device_type = ? AND status = 'active'
+               ORDER BY id LIMIT ? OFFSET ?"#
         )
         .bind(device_type)
         .bind(limit)
@@ -146,13 +160,66 @@ impl Device {
         Ok(devices)
     }
 
+    pub async fn list_by_type_with_status(
+        pool: &SqlitePool,
+        device_type: &str,
+        status: &str,
+        limit: i64,
+        offset: i64,
+    ) -> AppResult<Vec<Self>> {
+        let devices = sqlx::query_as::<_, Device>(
+            r#"SELECT id, device_id, device_type, firmware_version, hardware_version,
+                      battery_level, wifi_ssid, wifi_signal, status, last_heartbeat_at,
+                      created_at, updated_at
+               FROM devices WHERE device_type = ? AND status = ?
+               ORDER BY id LIMIT ? OFFSET ?"#
+        )
+        .bind(device_type)
+        .bind(status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
+        Ok(devices)
+    }
+
     pub async fn count_by_type(pool: &SqlitePool, device_type: &str) -> AppResult<i64> {
         let count: Option<i64> = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM devices WHERE device_type = ?"
+            "SELECT COUNT(*) FROM devices WHERE device_type = ? AND status = 'active'"
         )
         .bind(device_type)
         .fetch_one(pool)
         .await?;
         Ok(count.unwrap_or(0))
+    }
+
+    pub async fn transition_status(
+        pool: &SqlitePool,
+        device_id: &str,
+        new_status: &str,
+        _actor: &str,
+    ) -> AppResult<String> {
+        let device = Self::find_by_device_id(pool, device_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("Device {} not found", device_id)))?;
+
+        if !is_valid_device_state_transition(&device.status, new_status) {
+            return Err(AppError::BadRequest(format!(
+                "Invalid device state transition: {} -> {}",
+                device.status, new_status
+            )));
+        }
+
+        let now = Utc::now();
+        sqlx::query(
+            "UPDATE devices SET status = ?, updated_at = ? WHERE device_id = ?"
+        )
+        .bind(new_status)
+        .bind(now)
+        .bind(device_id)
+        .execute(pool)
+        .await?;
+
+        Ok(device.status)
     }
 }

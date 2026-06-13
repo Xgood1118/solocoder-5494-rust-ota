@@ -25,6 +25,22 @@ pub struct UpgradeStatusUpdate {
     pub failure_reason: Option<String>,
 }
 
+fn is_valid_state_transition(from: &str, to: &str) -> bool {
+    if from == to {
+        return true;
+    }
+
+    match from {
+        "pending" => matches!(to, "downloading" | "failed"),
+        "downloading" => matches!(to, "installing" | "failed"),
+        "installing" => matches!(to, "success" | "failed"),
+        "success" => matches!(to, "rebooted"),
+        "failed" => matches!(to, "downloading"),
+        "rebooted" => false,
+        _ => false,
+    }
+}
+
 impl DeviceUpgrade {
     pub async fn find_by_task_and_device(
         pool: &SqlitePool,
@@ -51,7 +67,7 @@ impl DeviceUpgrade {
             r#"SELECT id, task_id, device_id, firmware_id, status, gray_stage,
                       failure_reason, started_at, completed_at, created_at, updated_at
                FROM device_upgrades
-               WHERE device_id = ? AND status IN ('pending', 'downloading', 'installing')
+               WHERE device_id = ? AND status IN ('pending', 'downloading', 'installing', 'failed')
                ORDER BY id DESC"#
         )
         .bind(device_id)
@@ -123,6 +139,34 @@ impl DeviceUpgrade {
         .execute(pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn transition_status(
+        pool: &SqlitePool,
+        id: i64,
+        new_status: &str,
+        failure_reason: Option<&str>,
+    ) -> AppResult<String> {
+        let current = sqlx::query_as::<_, DeviceUpgrade>(
+            r#"SELECT id, task_id, device_id, firmware_id, status, gray_stage,
+                      failure_reason, started_at, completed_at, created_at, updated_at
+               FROM device_upgrades WHERE id = ?"#
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or_else(|| crate::error::AppError::NotFound(format!("Device upgrade {} not found", id)))?;
+
+        if !is_valid_state_transition(&current.status, new_status) {
+            return Err(crate::error::AppError::BadRequest(format!(
+                "Invalid state transition: {} -> {}",
+                current.status, new_status
+            )));
+        }
+
+        Self::update_status(pool, id, new_status, failure_reason).await?;
+
+        Ok(current.status)
     }
 
     pub async fn count_by_status(pool: &SqlitePool, task_id: i64, status: &str) -> AppResult<i64> {

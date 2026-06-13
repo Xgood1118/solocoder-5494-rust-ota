@@ -10,6 +10,7 @@ pub struct Config {
     pub download_url_expiry_secs: u64,
     pub hmac_primary_key: String,
     pub hmac_secondary_key: String,
+    pub encryption_key: String,
 }
 
 impl Config {
@@ -39,6 +40,9 @@ impl Config {
         let hmac_secondary_key = env::var("HMAC_SECONDARY_KEY")
             .unwrap_or_else(|_| "secondary-secret-key-change-in-production".to_string());
 
+        let encryption_key = env::var("ENCRYPTION_KEY")
+            .unwrap_or_else(|_| "default-encryption-key-change-in-production-please".to_string());
+
         Self {
             port,
             database_url,
@@ -48,6 +52,7 @@ impl Config {
             download_url_expiry_secs,
             hmac_primary_key,
             hmac_secondary_key,
+            encryption_key,
         }
     }
 }

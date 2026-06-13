@@ -1,7 +1,29 @@
+use sha2::{Sha256, Digest};
 use sqlx::SqlitePool;
 
 use crate::error::AppResult;
 use crate::models::{Device, UpgradeTask, DeviceUpgrade, AuditLog, AppMetrics};
+
+fn device_gray_percentage(device_id: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(device_id.as_bytes());
+    let hash = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash[..8]);
+    let num = u64::from_be_bytes(bytes);
+    num % 10000 / 100
+}
+
+fn is_device_in_gray(device_id: &str, percentage: i64) -> bool {
+    let pct = percentage.max(0).min(100) as u64;
+    if pct >= 100 {
+        return true;
+    }
+    if pct == 0 {
+        return false;
+    }
+    device_gray_percentage(device_id) < pct
+}
 
 #[derive(Clone)]
 pub struct GrayEngine {
@@ -86,49 +108,71 @@ impl GrayEngine {
             return Ok(());
         }
 
-        let total_devices = Device::count_by_type(&self.pool, &task.device_type).await?;
         let percentage = task.get_current_gray_percentage();
-        let target_count = ((total_devices as f64) * (percentage as f64) / 100.0).ceil() as i64;
+        let batch_size = 500;
+        let mut offset = 0i64;
+        let mut assigned_count = 0i64;
 
-        let already_assigned = DeviceUpgrade::count_total(&self.pool, task.id).await?;
-        let needed = target_count - already_assigned;
+        loop {
+            let devices = Device::list_by_type(
+                &self.pool,
+                &task.device_type,
+                batch_size,
+                offset,
+            )
+            .await?;
 
-        if needed <= 0 {
-            return Ok(());
+            if devices.is_empty() {
+                break;
+            }
+
+            for device in &devices {
+                if !is_device_in_gray(&device.device_id, percentage) {
+                    continue;
+                }
+
+                if !self.meets_constraints(device, task) {
+                    continue;
+                }
+
+                let existing = DeviceUpgrade::find_by_task_and_device(
+                    &self.pool,
+                    task.id,
+                    &device.device_id,
+                )
+                .await?;
+
+                if existing.is_some() {
+                    continue;
+                }
+
+                DeviceUpgrade::create(
+                    &self.pool,
+                    task.id,
+                    &device.device_id,
+                    task.firmware_id,
+                    task.gray_stage,
+                )
+                .await?;
+
+                assigned_count += 1;
+            }
+
+            if devices.len() < batch_size as usize {
+                break;
+            }
+
+            offset += batch_size;
         }
 
-        let devices = Device::list_by_type(
-            &self.pool,
-            &task.device_type,
-            needed,
-            already_assigned,
-        )
-        .await?;
-
-        for device in devices {
-            if !self.meets_constraints(&device, task) {
-                continue;
-            }
-
-            let existing = DeviceUpgrade::find_by_task_and_device(
-                &self.pool,
+        if assigned_count > 0 {
+            tracing::info!(
+                "Task {} assigned {} devices for gray stage {} ({}%)",
                 task.id,
-                &device.device_id,
-            )
-            .await?;
-
-            if existing.is_some() {
-                continue;
-            }
-
-            DeviceUpgrade::create(
-                &self.pool,
-                task.id,
-                &device.device_id,
-                task.firmware_id,
+                assigned_count,
                 task.gray_stage,
-            )
-            .await?;
+                percentage
+            );
         }
 
         Ok(())

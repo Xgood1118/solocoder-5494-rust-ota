@@ -35,6 +35,15 @@ pub async fn check_version(
 ) -> AppResult<Json<CheckVersionResponse>> {
     let device = Device::upsert(&state.pool, &device_id, &req.device_type).await?;
 
+    if device.status != "active" {
+        return Ok(Json(CheckVersionResponse {
+            has_update: false,
+            firmware: None,
+            download_url: None,
+            task_id: None,
+        }));
+    }
+
     let pending = DeviceUpgrade::find_pending_for_device(&state.pool, &device_id).await?;
 
     let base_url = format!("http://localhost:{}", state.config.port);
@@ -189,56 +198,53 @@ pub async fn report_status(
             .await?;
 
         if let Some(upgrade) = upgrades.iter().find(|u| u.task_id == task_id) {
-            let old_status = upgrade.status.clone();
-            let valid_statuses = ["downloading", "installing", "success", "failed", "rebooted"];
-            if valid_statuses.contains(&req.status.as_str()) {
-                DeviceUpgrade::update_status(
-                    &state.pool,
-                    upgrade.id,
-                    &req.status,
-                    req.error_message.as_deref(),
-                )
-                .await?;
+            let old_status = DeviceUpgrade::transition_status(
+                &state.pool,
+                upgrade.id,
+                &req.status,
+                req.error_message.as_deref(),
+            )
+            .await?;
 
-                match req.status.as_str() {
-                    "downloading" => {
-                        if old_status != "downloading" {
-                            state.metrics.upgrade_downloading.inc();
-                        }
-                        if old_status == "installing" {
-                            state.metrics.upgrade_installing.dec();
-                        }
+            let new_status = req.status.as_str();
+            match new_status {
+                "downloading" => {
+                    if old_status != "downloading" {
+                        state.metrics.upgrade_downloading.inc();
                     }
-                    "installing" => {
-                        if old_status != "installing" {
-                            state.metrics.upgrade_installing.inc();
-                        }
-                        if old_status == "downloading" {
-                            state.metrics.upgrade_downloading.dec();
-                        }
+                    if old_status == "installing" {
+                        state.metrics.upgrade_installing.dec();
                     }
-                    "success" => {
-                        state.metrics.upgrade_success.inc();
-                        if old_status == "downloading" {
-                            state.metrics.upgrade_downloading.dec();
-                        }
-                        if old_status == "installing" {
-                            state.metrics.upgrade_installing.dec();
-                        }
-                    }
-                    "failed" | "rebooted" => {
-                        if req.status == "failed" {
-                            state.metrics.upgrade_failed.inc();
-                        }
-                        if old_status == "downloading" {
-                            state.metrics.upgrade_downloading.dec();
-                        }
-                        if old_status == "installing" {
-                            state.metrics.upgrade_installing.dec();
-                        }
-                    }
-                    _ => {}
                 }
+                "installing" => {
+                    if old_status != "installing" {
+                        state.metrics.upgrade_installing.inc();
+                    }
+                    if old_status == "downloading" {
+                        state.metrics.upgrade_downloading.dec();
+                    }
+                }
+                "success" => {
+                    state.metrics.upgrade_success.inc();
+                    if old_status == "downloading" {
+                        state.metrics.upgrade_downloading.dec();
+                    }
+                    if old_status == "installing" {
+                        state.metrics.upgrade_installing.dec();
+                    }
+                }
+                "failed" | "rebooted" => {
+                    if new_status == "failed" {
+                        state.metrics.upgrade_failed.inc();
+                    }
+                    if old_status == "downloading" {
+                        state.metrics.upgrade_downloading.dec();
+                    }
+                    if old_status == "installing" {
+                        state.metrics.upgrade_installing.dec();
+                    }
+                }
+                _ => {}
             }
         }
     }
